@@ -27,6 +27,10 @@ from typing import Any, Final, Literal
 from deepagents.backends.protocol import (
     ASYNC_GLOB_TIMEOUT,
     ASYNC_GREP_TIMEOUT,
+    FILE_NOT_FOUND,
+    INVALID_PATH,
+    NOT_A_DIRECTORY,
+    PERMISSION_DENIED,
     DeleteResult,
     EditResult,
     ExecuteOffloadResult,
@@ -34,6 +38,7 @@ from deepagents.backends.protocol import (
     FileData,
     FileDownloadResponse,
     FileInfo,
+    FileOperationError,
     FileUploadResponse,
     GlobResult,
     GlobTruncationReason,
@@ -43,6 +48,7 @@ from deepagents.backends.protocol import (
     ReadResult,
     SandboxBackendProtocol,
     WriteResult,
+    _as_file_operation_error,
     execute_accepts_timeout,
 )
 from deepagents.backends.utils import (
@@ -880,6 +886,13 @@ except PermissionError:
 " 2>/dev/null"""
 
 
+_LS_ERROR_CODES: Final[dict[str, FileOperationError]] = {
+    "path_not_found": FILE_NOT_FOUND,
+    "permission_denied": PERMISSION_DENIED,
+    "not_a_directory": NOT_A_DIRECTORY,
+}
+
+
 def _parse_ls_output(output: str, path: str) -> LsResult:
     file_infos: list[FileInfo] = []
     error: str | None = None
@@ -895,7 +908,7 @@ def _parse_ls_output(output: str, path: str) -> LsResult:
             continue
         file_infos.append({"path": data["path"], "is_dir": data["is_dir"]})
     if error is not None:
-        return LsResult(entries=None, error=f"Path '{path}': {error}")
+        return LsResult(entries=None, error=f"Path '{path}': {error}", error_code=_LS_ERROR_CODES.get(error))
     return LsResult(entries=file_infos)
 
 
@@ -953,10 +966,21 @@ def _build_write_preflight_cmd(file_path: str) -> str:
     return _WRITE_CHECK_TEMPLATE.format(path_b64=path_b64)
 
 
+_SHELL_ERROR_CODES: Final[dict[str, FileOperationError]] = {
+    "Permission denied": PERMISSION_DENIED,
+    "Not a directory": INVALID_PATH,
+    "File exists": INVALID_PATH,
+}
+
+
+def _shell_error_code(output: str) -> FileOperationError | None:
+    return next((code for text, code in _SHELL_ERROR_CODES.items() if text in output), None)
+
+
 def _check_preflight_result(result: ExecuteResponse, file_path: str) -> WriteResult | None:
     if result.exit_code != 0 or "Error:" in result.output:
         error_msg = result.output.strip() or f"Failed to write file '{file_path}'"
-        return WriteResult(error=error_msg)
+        return WriteResult(error=error_msg, error_code=_shell_error_code(result.output))
     return None
 
 
@@ -1806,7 +1830,7 @@ class BaseSandbox(SandboxBackendProtocol, ABC):
             raise AssertionError(msg)
         response = responses[0]
         if response.error:
-            return WriteResult(error=f"Failed to write file '{file_path}': {response.error}")
+            return WriteResult(error=f"Failed to write file '{file_path}': {response.error}", error_code=_as_file_operation_error(response.error))
 
         return WriteResult(path=file_path)
 
@@ -1821,7 +1845,7 @@ class BaseSandbox(SandboxBackendProtocol, ABC):
             raise AssertionError(msg)
         response = responses[0]
         if response.error:
-            return WriteResult(error=f"Failed to write file '{file_path}': {response.error}")
+            return WriteResult(error=f"Failed to write file '{file_path}': {response.error}", error_code=_as_file_operation_error(response.error))
         return WriteResult(path=file_path)
 
     def edit(
@@ -2052,13 +2076,16 @@ class BaseSandbox(SandboxBackendProtocol, ABC):
         # through to `rm` on an unknown probe result (matches the `rm` check
         # below and `_parse_grep_output`, which both guard `is not None`).
         if exists.exit_code is not None and exists.exit_code != 0:
-            return DeleteResult(error=f"Error: '{file_path}' not found")
+            return DeleteResult(error=f"Error: '{file_path}' not found", error_code=FILE_NOT_FOUND)
         result = self.execute(f"rm -rf {quoted}")
 
         if result.exit_code == 0:
             return DeleteResult(path=file_path)
 
-        return DeleteResult(error=f"Error deleting file '{file_path}': {result.output.strip() or 'unknown error'}")
+        return DeleteResult(
+            error=f"Error deleting file '{file_path}': {result.output.strip() or 'unknown error'}",
+            error_code=_shell_error_code(result.output),
+        )
 
     def grep(
         self,
