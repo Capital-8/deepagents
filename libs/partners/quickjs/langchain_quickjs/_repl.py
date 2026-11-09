@@ -14,7 +14,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, get_type_hints
+from typing import TYPE_CHECKING, Any, NamedTuple, get_type_hints
 
 from langchain_core.tools.base import (
     InjectedToolCallId,
@@ -41,6 +41,7 @@ from quickjs_rs import (
     TimeoutError as QJSTimeoutError,
 )
 
+from langchain_quickjs import _fs
 from langchain_quickjs._format import (
     coerce_tool_output_for_ptc,
     format_handle,
@@ -53,7 +54,7 @@ from langchain_quickjs._subagent import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from langchain_core.tools import BaseTool
     from langgraph.prebuilt import ToolRuntime
@@ -119,6 +120,15 @@ class _PTCCallBudgetExceededError(RuntimeError):
         )
 
 
+class _EvalEndedError(RuntimeError):
+    """Signals a host call made after the eval already ended."""
+
+
+class _EvalEnd(NamedTuple):
+    error_type: str
+    message: str
+
+
 class _TaskBridgeError(RuntimeError):
     """Wrap errors from the top-level `task()` host function."""
 
@@ -135,6 +145,9 @@ class _PTCState:
     remaining_calls: int | None
     outer_runtime: ToolRuntime | None = None
     outer_loop: asyncio.AbstractEventLoop | None = None
+    chain: _fs.ToolChain | None = None
+    fs_tools: Mapping[str, BaseTool] = field(default_factory=dict)
+    ended: _EvalEnd | None = None
     task_dispatch_count: int = 0
     """Ordinal for the next `task()` dispatch in this eval.
 
@@ -413,6 +426,7 @@ class _ThreadREPL:
         if self._subagents_enabled:
             self._task_calls = asyncio.Semaphore(self._max_subagent_concurrency)
             self._register_task_bridge()
+        self._register_fs_bridge()
 
     def _require_ctx(self) -> Context:
         """Return the live QuickJS context or raise if this REPL is closed."""
@@ -591,10 +605,7 @@ class _ThreadREPL:
         ctx = self._require_ctx()
 
         async def _bridge(raw_input: Any = None) -> Any:
-            state = self._ptc_state
-            if state is None:
-                msg = "task bridge called outside active eval"
-                raise ConcurrentEvalError(msg)
+            state = self._require_open("task bridge")
             task_calls = self._task_calls
             if task_calls is None:
                 msg = "task call limiter not initialized"
@@ -688,10 +699,7 @@ class _ThreadREPL:
                 # it, fail loud.
                 msg = f"tool '{camel}' not registered"
                 raise RuntimeError(msg)
-            if self._ptc_state is None:
-                msg = "PTC bridge called outside active eval"
-                raise ConcurrentEvalError(msg)
-            state = self._ptc_state.consume_call_budget(
+            state = self._require_open("PTC bridge").consume_call_budget(
                 function_name=f"tools.{camel}",
                 max_ptc_calls=self._max_ptc_calls,
             )
@@ -717,6 +725,60 @@ class _ThreadREPL:
         ctx.register(bridge_symbol, _bridge, is_async=True)
         return bridge_symbol
 
+    def _register_fs_bridge(self) -> None:
+        ctx = self._require_ctx()
+        ctx.register(_fs.HOST_FUNCTION, self._fs_call, is_async=True)
+        ctx.eval(
+            f"Object.defineProperty(globalThis, '{_fs.HOST_FUNCTION}',"
+            " { writable: false, configurable: false }); undefined"
+        )
+
+    async def _fs_call(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            state = self._require_open("fs")
+            return {"value": await self._run_fs(state, op, args)}
+        except _fs.FsError as e:
+            return e.reply
+        except _EvalEndedError as e:
+            return _fs.refused(op, args["path"], str(e)).reply
+
+    async def _run_fs(self, state: _PTCState, op: str, args: dict[str, Any]) -> Any:
+        if state.chain is None:
+            reason = "fs runs only through the agent's tool-call middleware"
+            raise _fs.refused(op, args["path"], reason)
+        path, tool, arguments = _fs.plan(op, args, state.fs_tools)
+        self._ptc_state = state.consume_call_budget(
+            function_name=f"fs.{op}", max_ptc_calls=self._max_ptc_calls
+        )
+        call_id = _synth_tool_call_id(tool.name)
+        request = _fs.nested_request(state.chain, tool, arguments, call_id)
+        try:
+            outcome = await state.chain.submit(request)
+        except GraphInterrupt as e:
+            # Middleware below asked to pause the agent mid-eval. Its interrupt
+            # took a place in the eval call's interrupt order, so later calls
+            # could be handed the wrong resume value; end the eval instead.
+            error_type, message = _fs.interruption(tool.name, e)
+            self._end_eval(error_type, message)
+            raise _fs.refused(op, path, message) from None
+        except Exception as e:  # noqa: BLE001  # a failing middleware or tool rejects this one fs call
+            raise _fs.failed(op, path, e) from None
+        return _fs.result(op, path, outcome)
+
+    def _require_open(self, caller: str) -> _PTCState:
+        state = self._ptc_state
+        if state is None:
+            msg = f"{caller} called outside active eval"
+            raise ConcurrentEvalError(msg)
+        if state.ended is not None:
+            raise _EvalEndedError(state.ended.message)
+        return state
+
+    def _end_eval(self, error_type: str, message: str) -> None:
+        if self._ptc_state is not None and self._ptc_state.ended is None:
+            ended = _EvalEnd(error_type, message)
+            self._ptc_state = replace(self._ptc_state, ended=ended)
+
     def eval_sync(
         self,
         code: str,
@@ -724,6 +786,8 @@ class _ThreadREPL:
         outer_runtime: ToolRuntime | None = None,
         snapshot_payload: bytes | None = None,
         tools: Sequence[BaseTool] | None = None,
+        chain: _fs.ToolChain | None = None,
+        fs_tools: Mapping[str, BaseTool] | None = None,
     ) -> EvalOutcome:
         # Both sync and async entry points funnel through ctx.eval_async on
         # the worker loop. Sync ctx.eval can't dispatch async host functions
@@ -735,6 +799,8 @@ class _ThreadREPL:
                 outer_runtime=outer_runtime,
                 snapshot_payload=snapshot_payload,
                 tools=tools,
+                chain=chain,
+                fs_tools=fs_tools,
             )
         )
 
@@ -746,6 +812,8 @@ class _ThreadREPL:
         snapshot_payload: bytes | None = None,
         tools: Sequence[BaseTool] | None = None,
         outer_loop: asyncio.AbstractEventLoop | None = None,
+        chain: _fs.ToolChain | None = None,
+        fs_tools: Mapping[str, BaseTool] | None = None,
     ) -> EvalOutcome:
         return await self._worker.run_async(
             self._aeval_async(
@@ -754,6 +822,8 @@ class _ThreadREPL:
                 snapshot_payload=snapshot_payload,
                 tools=tools,
                 outer_loop=outer_loop,
+                chain=chain,
+                fs_tools=fs_tools,
             )
         )
 
@@ -794,7 +864,10 @@ class _ThreadREPL:
         )
 
     async def _aprepare_for_eval(
-        self, payload: bytes | None, tools: Sequence[BaseTool] | None
+        self,
+        payload: bytes | None,
+        tools: Sequence[BaseTool] | None,
+        fs_tools: Mapping[str, BaseTool],
     ) -> None:
         """Restore once and bind current tools on the owning worker."""
         if not self._prepared_for_eval:
@@ -808,6 +881,8 @@ class _ThreadREPL:
                     raise _SnapshotRestoreError(msg) from exc
         if tools is not None:
             await self._ainstall_tools(tools)
+        if fs_tools:
+            self._require_ctx().eval(_fs.install_source())
 
     async def _aeval_async(  # noqa: C901, PLR0912, PLR0915
         self,
@@ -817,6 +892,8 @@ class _ThreadREPL:
         snapshot_payload: bytes | None = None,
         tools: Sequence[BaseTool] | None = None,
         outer_loop: asyncio.AbstractEventLoop | None = None,
+        chain: _fs.ToolChain | None = None,
+        fs_tools: Mapping[str, BaseTool] | None = None,
     ) -> EvalOutcome:
         """Uses `ctx.eval_async` directly.
 
@@ -836,9 +913,11 @@ class _ThreadREPL:
             remaining_calls=self._max_ptc_calls,
             outer_runtime=outer_runtime,
             outer_loop=outer_loop,
+            chain=chain,
+            fs_tools=fs_tools or {},
         )
         try:
-            await self._aprepare_for_eval(snapshot_payload, tools)
+            await self._aprepare_for_eval(snapshot_payload, tools, fs_tools or {})
             # Drive any final-expression Promise (e.g. a bare async
             # IIFE) to its resolved value before marshaling. Without
             # this the Promise object itself fails to marshal and
@@ -903,13 +982,24 @@ class _ThreadREPL:
             outcome.error_type = "OutOfMemory"
             outcome.error_message = str(e)
             _clear_exception_references(e)
+        except MarshalError as e:
+            # A host result, such as a large `fs.readFile`, did not fit the heap.
+            outcome.error_type = "OutOfMemory"
+            outcome.error_message = f"a host result did not fit in memory ({e})"
+            _clear_exception_references(e)
         except _TaskBridgeError as e:
             outcome.error_type = e.error_type
             outcome.error_message = e.error_message
             _clear_exception_references(e)
+        except _EvalEndedError as e:
+            _clear_exception_references(e)
         finally:
+            ended = self._ptc_state.ended if self._ptc_state is not None else None
             self._ptc_state = prev_ptc_state
             outcome.stdout, outcome.stdout_truncated_chars = self._console.drain()
+        if ended is not None:
+            outcome.result = outcome.result_kind = outcome.error_stack = None
+            outcome.error_type, outcome.error_message = ended
         return outcome
 
     def _record_js_error(self, outcome: EvalOutcome, e: JSError) -> None:

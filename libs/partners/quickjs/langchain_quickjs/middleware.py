@@ -2,10 +2,11 @@
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import sys
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired
 
 from deepagents.middleware._utils import append_to_system_message
@@ -25,12 +26,14 @@ from langchain_core._api import beta
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.channels import DeltaChannel
+from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from langgraph.runtime import Runtime
 
+from langchain_quickjs import _fs
 from langchain_quickjs._format import format_outcome
 from langchain_quickjs._prompt import (
     render_eval_tool_code_doc,
@@ -65,6 +68,10 @@ _DEFAULT_TIMEOUT = 5.0
 _DEFAULT_MAX_PTC_CALLS = 256
 _DEFAULT_MAX_RESULT_CHARS = 4_000
 _DEFAULT_TOOL_NAME = "eval"
+
+_EVAL_CHAIN: contextvars.ContextVar[_fs.ToolChain | None] = contextvars.ContextVar(
+    "_EVAL_CHAIN", default=None
+)
 
 PersistenceMode = Literal["thread", "turn", "call"]
 
@@ -111,6 +118,13 @@ def _resolve_mode(
             raise ValueError(msg)
 
 
+def _chain_for(runtime: ToolRuntime[None, Any]) -> _fs.ToolChain | None:
+    chain = _EVAL_CHAIN.get()
+    if chain is None or chain.request.tool_call["id"] != runtime.tool_call_id:
+        return None
+    return chain
+
+
 def _same_tools(cached: tuple[BaseTool, ...], exposed: tuple[BaseTool, ...]) -> bool:
     """Whether `exposed` is exactly the tools `cached` was rendered from."""
     return len(cached) == len(exposed) and all(
@@ -151,7 +165,7 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                 then runs forever, and asyncio cancellation cannot stop it.
                 Only use it with an external limit that can, such as a
                 process kill or workflow timeout.
-        max_ptc_calls: Maximum number of `tools.*` bridge calls allowed
+        max_ptc_calls: Maximum number of `tools.*` and `fs` calls allowed
             during one `eval` execution. Exceeding this budget throws
             from the host-function bridge before invoking the tool.
             Uncaught overflows surface as `PTCCallBudgetExceeded`.
@@ -164,6 +178,27 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                 unbounded PTC host-call loops (DoS risk). Only disable in trusted
                 environments.
 
+        fs: If `True`, give code a Node-style `fs` global over the agent's file
+            tools, such as `await fs.readFile(path)`, when the model sees
+            `read_file` on that call. Each `fs` call is one call to that tool,
+            made through the tool-call middleware listed after this one, so
+            permission rules apply. `fs` reads UTF-8 text only, and only async
+            functions exist. Without that middleware, as when the eval tool is
+            invoked directly, `fs` throws `EACCES`. Set to `False` for no `fs`.
+
+            A file too big for the QuickJS heap (`memory_limit`) ends the
+            eval with `OutOfMemory`.
+
+            !!! warning
+
+                A call from code cannot pause for approval. A gated `fs` call
+                under a per-call `HumanInTheLoopMiddleware` ends the eval with
+                `ApprovalRequired`. A batched one refuses it, so `fs` throws
+                `EACCES`, only with a `langchain` release that refuses gated
+                calls the model did not make; with earlier releases `fs` calls
+                run unreviewed. Under per-call approval, on a resumed run an
+                `fs` call made alongside code that waits on an interrupt, as in
+                `Promise.all`, can take that interrupt's answer.
         tool_name: Name of the tool exposed to the model. Default `eval`.
         max_result_chars: Result and stdout blocks are independently
             truncated to this many characters before being sent back to
@@ -263,6 +298,7 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         subagents: bool = True,
         max_subagent_concurrency: int = _DEFAULT_MAX_SUBAGENT_CONCURRENCY,
         ptc: PTCOption | None = None,
+        fs: bool = True,
         mode: PersistenceMode | None = None,
         max_snapshot_bytes: int | None = None,
         snapshot_signing_key: str | bytes | None = None,
@@ -290,6 +326,7 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         self._subagents = subagents
         self._max_subagent_concurrency = max_subagent_concurrency
         self._ptc = ptc
+        self._fs = fs
         self._mode = _resolve_mode(mode=mode)
         self._max_snapshot_bytes = (
             memory_limit if max_snapshot_bytes is None else max_snapshot_bytes
@@ -310,6 +347,7 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         )
         self._memory_limit_mb = memory_limit // (1024 * 1024)
         self._base_prompt_cache: dict[bool, str] = {}
+        self._fs_tools_by_slot: dict[str, dict[str, BaseTool]] = {}
         self._ptc_tools_by_slot: dict[str, tuple[BaseTool, ...]] = {}
         # Rendered `tools` namespace per slot, with the tools it was rendered from.
         self._ptc_prompt_by_slot: dict[str, tuple[tuple[BaseTool, ...], str]] = {}
@@ -367,6 +405,8 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                     outer_runtime=runtime,
                     snapshot_payload=middleware._snapshot_for_eval(runtime.state),
                     tools=middleware._tools_for_eval(slot_id),
+                    chain=_chain_for(runtime),
+                    fs_tools=middleware._fs_tools_by_slot.get(slot_id),
                 )
             except _SnapshotRestoreError as exc:
                 return _restore_error_output(exc, runtime.tool_call_id)
@@ -388,6 +428,8 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                     snapshot_payload=middleware._snapshot_for_eval(runtime.state),
                     tools=middleware._tools_for_eval(slot_id),
                     outer_loop=asyncio.get_running_loop(),
+                    chain=_chain_for(runtime),
+                    fs_tools=middleware._fs_tools_by_slot.get(slot_id),
                 )
             except _SnapshotRestoreError as exc:
                 return _restore_error_output(exc, runtime.tool_call_id)
@@ -518,6 +560,37 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         """Async variant of lazy slot preparation."""
         return self.before_agent(state, runtime)
 
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command],
+    ) -> ToolMessage | Command:
+        """Capture the middleware below this one for the eval call's `fs` calls."""
+        if request.tool_call["name"] != self._tool_name:
+            return handler(request)
+        chain = _fs.SyncChain(request, handler, contextvars.copy_context())
+        token = _EVAL_CHAIN.set(chain)
+        try:
+            return handler(request)
+        finally:
+            _EVAL_CHAIN.reset(token)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
+    ) -> ToolMessage | Command:
+        """Async variant of `wrap_tool_call`."""
+        if request.tool_call["name"] != self._tool_name:
+            return await handler(request)
+        loop = asyncio.get_running_loop()
+        chain = _fs.AsyncChain(request, handler, loop, contextvars.copy_context())
+        token = _EVAL_CHAIN.set(chain)
+        try:
+            return await handler(request)
+        finally:
+            _EVAL_CHAIN.reset(token)
+
     def wrap_model_call(
         self,
         request: ModelRequest[ContextT],
@@ -581,6 +654,7 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                 max_subagent_concurrency=self._max_subagent_concurrency,
             )
 
+        self._bind_fs(request, request_tools)
         if self._ptc is None:
             return self._base_prompt(ptc_attached=False) + subagent_section
 
@@ -605,6 +679,15 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
             )
             self._ptc_prompt_by_slot[slot_id] = cached
         return prompt + cached[1]
+
+    def _bind_fs(
+        self, request: ModelRequest[ContextT], tools: Sequence[BaseTool]
+    ) -> None:
+        files = [t for t in tools if isinstance(t, BaseTool) and t.name in _fs.TOOLS]
+        bound = {t.name: t for t in files} if self._fs else {}
+        state = getattr(request, "state", None) or {}
+        if bound or "_quickjs_slot_id" in state:
+            self._fs_tools_by_slot[self._slot_id(state)] = bound
 
     def _extend(
         self, system_message: SystemMessage | None, prompt: str
@@ -651,6 +734,7 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         slot_id = self._slot_id(state)
         self._ptc_tools_by_slot.pop(slot_id, None)
         self._ptc_prompt_by_slot.pop(slot_id, None)
+        self._fs_tools_by_slot.pop(slot_id, None)
         if self._mode != "thread":
             self._registry.evict(slot_id)
             return None
@@ -686,6 +770,7 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         slot_id = self._slot_id(state)
         self._ptc_tools_by_slot.pop(slot_id, None)
         self._ptc_prompt_by_slot.pop(slot_id, None)
+        self._fs_tools_by_slot.pop(slot_id, None)
         if self._mode != "thread":
             await self._registry.aevict(slot_id)
             return None
