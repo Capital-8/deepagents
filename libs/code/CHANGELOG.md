@@ -2,6 +2,14 @@
 
 # Deep Agents Code Changelog
 
+## [0.2.6](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.2.5...deepagents-code==0.2.6) (2026-11-09)
+
+
+### Bug Fixes
+
+* **code:** keep queued prompts beside long message text ([#7611](https://github.com/langchain-ai/deepagents/issues/7611)) ([cdbcaff](https://github.com/langchain-ai/deepagents/commit/cdbcaffcb309e983a9e2dc0dba9fa0b819e118f9))
+* **code:** offer recovery for server startup timeouts ([#7610](https://github.com/langchain-ai/deepagents/issues/7610)) ([e3a7898](https://github.com/langchain-ai/deepagents/commit/e3a789816e2a38932360cae05ec53c133e79465e))
+
 ## [0.2.5](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.2.4...deepagents-code==0.2.5) (2026-11-05)
 
 ### Bug Fixes
