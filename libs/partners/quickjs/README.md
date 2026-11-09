@@ -90,7 +90,7 @@ fib(10)  // 55
 
 ### Sandbox
 
-The REPL runs in a QuickJS context with **no ambient capabilities**. There is no filesystem, no network, no `fetch`, no `require`, no real clock (`Date.now()` is whatever QuickJS provides, not wall-clock for security-sensitive uses), no `process`, no `import` of anything you didn't explicitly install.
+The REPL runs in a QuickJS context with **no ambient capabilities**. Files are reachable only through `fs`, whose async, text-only functions call the agent's own file tools through its tool-call middleware (`fs=False` removes it). There is no network, no `fetch`, no `require`, no real clock (`Date.now()` is whatever QuickJS provides, not wall-clock for security-sensitive uses), no `process`, no `import` of anything you didn't explicitly install.
 
 Capabilities can be explicitly added using **PTC** to call into the agent's own tools (see below).
 

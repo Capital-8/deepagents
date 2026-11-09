@@ -748,7 +748,7 @@ class _ThreadREPL:
             raise _fs.refused(op, args["path"], reason)
         path, tool, arguments = _fs.plan(op, args, state.fs_tools)
         self._ptc_state = state.consume_call_budget(
-            function_name=f"fs.{op}", max_ptc_calls=self._max_ptc_calls
+            function_name=_fs.public_name(op), max_ptc_calls=self._max_ptc_calls
         )
         call_id = _synth_tool_call_id(tool.name)
         request = _fs.nested_request(state.chain, tool, arguments, call_id)

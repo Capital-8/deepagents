@@ -4,8 +4,8 @@ An `eval` tool is available. It runs JavaScript in a persistent REPL.
 
 - State (variables, functions) persists across tool calls and across multiple turns for this conversation thread.
 - Top-level `await` works; Promises resolve before the call returns.
-- Runtime sandbox: no built-in filesystem, network, stdlib, or wall-clock APIs (`fetch`, `require`, `fs`, `process`, real `Date.now()` are unavailable or stubbed).
-- The REPL has no access to host tools, files, or the network: it is pure computation. Return values to communicate results.
+- Runtime sandbox: no network, stdlib, or wall-clock APIs (`fetch`, `process`, real `Date.now()` are unavailable or stubbed). Files are reachable through `fs`, documented below.
+- Apart from `fs`, the REPL has no access to host tools or the network. Return values to communicate results.
 - Timeout: 5.0s per call. Memory: 64 MB total.
 - `console.log` output is captured and returned alongside the result.
 
@@ -236,3 +236,14 @@ yourself. Explore with your own tools first as needed, then write JavaScript
 in the `eval` tool that dispatches subagents with `task()` and
 assembles their results. The point is to distribute the heavy work in
 parallel, not to grind through it one tool call at a time.
+
+### Files: `fs`
+
+`fs` is a global over this agent's files, the same files your file tools see. Every `fs` call runs one or more of those tools, so the same permission rules apply. Its functions return Promises, as Node's `fs/promises` does (`fs.promises` is the same API), and read and write UTF-8 text only. Paths are absolute; relative paths resolve from `/`.
+
+- `await fs.readFile(path)` returns the whole file as a string, without line numbers or headers, as in `JSON.parse(await fs.readFile("/a.json"))`.
+- `await fs.writeFile(path, text)` creates or replaces a file, creating parent directories.
+- `await fs.readdir(dir)` lists entry names. `await fs.access(path)` rejects with `ENOENT` if the path is missing; as a boolean, `await fs.access(path).then(() => true, () => false)`.
+- `await fs.rm(path, { recursive, force })` deletes as Node's does: a directory needs `recursive: true`, and `force: true` ignores a missing path.
+- Errors are Node errors: check `err.code`, such as `ENOENT`, `EISDIR`, or `EACCES`. A file tool that needs human approval cannot run from code, so `fs` throws `EACCES` for it; call that tool yourself instead.
+- There are no sync functions such as `readFileSync`, no streams or callbacks, and no `require`.

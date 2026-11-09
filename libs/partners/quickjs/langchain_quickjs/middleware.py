@@ -38,6 +38,7 @@ from langchain_quickjs._format import format_outcome
 from langchain_quickjs._prompt import (
     render_eval_tool_code_doc,
     render_eval_tool_description,
+    render_fs_system_prompt,
     render_repl_system_prompt,
     render_subagent_system_prompt,
 )
@@ -96,7 +97,7 @@ class EvalSchema(BaseModel):
     code: str = Field(
         description=(
             "JavaScript expression or statement(s) to evaluate. "
-            "No fs/network/real-clock access."
+            "No network/real-clock access."
         ),
     )
 
@@ -123,6 +124,10 @@ def _chain_for(runtime: ToolRuntime[None, Any]) -> _fs.ToolChain | None:
     if chain is None or chain.request.tool_call["id"] != runtime.tool_call_id:
         return None
     return chain
+
+
+def _with_section(prompt: str, section: str) -> str:
+    return prompt.rstrip("\n") + section if section else prompt
 
 
 def _same_tools(cached: tuple[BaseTool, ...], exposed: tuple[BaseTool, ...]) -> bool:
@@ -180,9 +185,10 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
 
         fs: If `True`, give code a Node-style `fs` global over the agent's file
             tools, such as `await fs.readFile(path)`, when the model sees
-            `read_file` on that call. Each `fs` call is one call to that tool,
-            made through the tool-call middleware listed after this one, so
-            permission rules apply. `fs` reads UTF-8 text only, and only async
+            `read_file`, `ls`, `write_file`, or `delete` on that call. Each
+            `fs` call runs one or more of those tools through the
+            tool-call middleware listed after this one, so permission rules
+            apply. `fs` reads and writes UTF-8 text only, and only async
             functions exist. Without that middleware, as when the eval tool is
             invoked directly, `fs` throws `EACCES`. Set to `False` for no `fs`.
 
@@ -346,7 +352,7 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
             max_subagent_concurrency=max_subagent_concurrency,
         )
         self._memory_limit_mb = memory_limit // (1024 * 1024)
-        self._base_prompt_cache: dict[bool, str] = {}
+        self._base_prompt_cache: dict[tuple[bool, bool], str] = {}
         self._fs_tools_by_slot: dict[str, dict[str, BaseTool]] = {}
         self._ptc_tools_by_slot: dict[str, tuple[BaseTool, ...]] = {}
         # Rendered `tools` namespace per slot, with the tools it was rendered from.
@@ -619,14 +625,12 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
             ),
         )
 
-    def _base_prompt(self, *, ptc_attached: bool) -> str:
+    def _base_prompt(self, *, ptc_attached: bool, files_attached: bool = False) -> str:
         """Return the base REPL system prompt, rendered lazily and memoized.
 
-        The text depends only on construction-time config and `ptc_attached`,
-        so it's computed on first use per boolean and cached. Avoids rendering
-        the `tools.*` variant at all when PTC is disabled.
+        Avoids rendering the `tools.*` variant at all when PTC is disabled.
         """
-        cached = self._base_prompt_cache.get(ptc_attached)
+        cached = self._base_prompt_cache.get((ptc_attached, files_attached))
         if cached is None:
             cached = render_repl_system_prompt(
                 tool_name=self._tool_name,
@@ -634,8 +638,9 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                 memory_limit_mb=self._memory_limit_mb,
                 mode=self._mode,
                 ptc_attached=ptc_attached,
+                files_attached=files_attached,
             )
-            self._base_prompt_cache[ptc_attached] = cached
+            self._base_prompt_cache[ptc_attached, files_attached] = cached
         return cached
 
     def _prepare_for_call(self, request: ModelRequest[ContextT]) -> str:
@@ -654,16 +659,19 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                 max_subagent_concurrency=self._max_subagent_concurrency,
             )
 
-        self._bind_fs(request, request_tools)
+        fs_section = render_fs_system_prompt(self._bind_fs(request, request_tools))
+        files = bool(fs_section)
         if self._ptc is None:
-            return self._base_prompt(ptc_attached=False) + subagent_section
+            prompt = self._base_prompt(ptc_attached=False, files_attached=files)
+            return _with_section(prompt + subagent_section, fs_section)
 
         exposed = filter_tools_for_ptc(
             request_tools,
             self._ptc,
             self_tool_name=self._tool_name,
         )
-        prompt = self._base_prompt(ptc_attached=bool(exposed)) + subagent_section
+        prompt = self._base_prompt(ptc_attached=bool(exposed), files_attached=files)
+        prompt += subagent_section
         slot_id = self._slot_id(getattr(request, "state", {}))
         exposed_tools = tuple(exposed)
         self._ptc_tools_by_slot[slot_id] = exposed_tools
@@ -678,16 +686,17 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                 render_ptc_prompt(exposed_tools, tool_name=self._tool_name),
             )
             self._ptc_prompt_by_slot[slot_id] = cached
-        return prompt + cached[1]
+        return _with_section(prompt + cached[1], fs_section)
 
     def _bind_fs(
         self, request: ModelRequest[ContextT], tools: Sequence[BaseTool]
-    ) -> None:
+    ) -> list[str]:
         files = [t for t in tools if isinstance(t, BaseTool) and t.name in _fs.TOOLS]
         bound = {t.name: t for t in files} if self._fs else {}
         state = getattr(request, "state", None) or {}
         if bound or "_quickjs_slot_id" in state:
             self._fs_tools_by_slot[self._slot_id(state)] = bound
+        return _fs.docs(bound)
 
     def _extend(
         self, system_message: SystemMessage | None, prompt: str

@@ -123,6 +123,7 @@ def test_middleware_after_the_interpreter_sees_each_fs_call(*, run_async: bool) 
     code = """const [a, b] = await Promise.all([
       fs.readFile("/docs/a.md"), fs.readFile("/docs/b.txt"),
     ]);
+    await fs.writeFile("/w.txt", a + b);
     JSON.stringify([a, b])"""
     recorder = _Recorder()
     agent = create_deep_agent(
@@ -132,7 +133,8 @@ def test_middleware_after_the_interpreter_sees_each_fs_call(*, run_async: bool) 
     state = _invoke(agent, {**_GO, "files": files()}, run_async=run_async)
 
     assert results(state) == [["hello\nworld", "plain"]]
-    assert sorted(recorder.calls) == ["eval", "read_file", "read_file"]
+    assert sorted(recorder.calls) == ["eval", "read_file", "read_file", "write_file"]
+    assert state["files"]["/w.txt"]["content"] == "hello\nworldplain"
 
 
 def test_a_refusal_from_middleware_throws_eacces_with_its_reason() -> None:
@@ -149,6 +151,37 @@ def test_a_refusal_from_middleware_throws_eacces_with_its_reason() -> None:
     assert results(state) == [
         ["EACCES", "EACCES: permission denied, open '/docs/b.txt' (reads need review)"]
     ]
+
+
+@pytest.mark.parametrize(
+    ("call", "tool"),
+    [('fs.writeFile("/a.txt", "y")', "write_file"), ('fs.rm("/a.txt")', "delete")],
+)
+def test_a_change_gated_per_call_ends_the_eval_and_changes_nothing(
+    tmp_path: Path, call: str, tool: str
+) -> None:
+    (tmp_path / "a.txt").write_text("x")
+    code = f"try {{ await {call} }} catch (e) {{ console.log(e.code) }}"
+    approval = HumanInTheLoopMiddleware(
+        interrupt_on={tool: True}, interrupt_mode="per_call"
+    )
+    backend = FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+    agent = create_agent(
+        model(code),
+        middleware=[
+            FilesystemMiddleware(backend=backend),
+            CodeInterpreterMiddleware(),
+            approval,
+        ],
+        checkpointer=InMemorySaver(),
+    )
+
+    state = _invoke(agent, _GO)
+
+    assert _eval_message(state).startswith(
+        f'<stdout>\nEACCES\n</stdout>\n<error type="ApprovalRequired">`{tool}`'
+    )
+    assert (tmp_path / "a.txt").read_text() == "x"
 
 
 @pytest.mark.parametrize("run_async", [False, True], ids=["invoke", "ainvoke"])
@@ -295,15 +328,16 @@ def test_an_oversized_read_ends_the_eval_with_out_of_memory(tmp_path: Path) -> N
 
 @pytest.mark.parametrize("enabled", [True, False], ids=["default", "fs=False"])
 def test_fs_is_on_by_default_and_off_with_the_opt_out(*, enabled: bool) -> None:
-    code = "JSON.stringify([typeof fs, typeof require])"
+    llm = model("JSON.stringify([typeof fs, typeof require])")
     agent = create_deep_agent(
-        model=model(code), middleware=[CodeInterpreterMiddleware(fs=enabled)]
+        model=llm, middleware=[CodeInterpreterMiddleware(fs=enabled)]
     )
 
     state = _invoke(agent, {**_GO, "files": files()})
 
     expected = ["object", "function"] if enabled else ["undefined", "undefined"]
     assert results(state) == [expected]
+    assert ("### Files: `fs`" in llm.prompts[0]) is enabled
 
 
 def test_a_provider_tool_given_as_a_dict_leaves_fs_working() -> None:
@@ -316,15 +350,34 @@ def test_a_provider_tool_given_as_a_dict_leaves_fs_working() -> None:
     assert isinstance(results(_invoke(agent, {**_GO, "files": files()}))[0], int)
 
 
-def test_fs_is_undefined_when_the_model_cannot_see_read_file() -> None:
+def test_fs_is_undefined_when_no_file_tool_is_bound() -> None:
+    llm = model("JSON.stringify(typeof fs)")
+    agent = create_agent(llm, middleware=[CodeInterpreterMiddleware()])
+
+    state = _invoke(agent, _GO)
+
+    assert results(state) == ["undefined"]
+    assert "### Files" not in llm.prompts[0]
+
+
+def test_fs_throws_enosys_for_a_file_tool_the_model_cannot_see() -> None:
+    code = (
+        CODE_OF
+        + """JSON.stringify([
+      await codeOf(() => fs.writeFile("/w.txt", "x")),
+      await fs.readFile("/docs/b.txt"),
+    ])"""
+    )
+    llm = model(code)
     agent = create_deep_agent(
-        model=model("JSON.stringify(typeof fs)"),
-        middleware=[_Hide("read_file"), CodeInterpreterMiddleware()],
+        model=llm, middleware=[_Hide("write_file"), CodeInterpreterMiddleware()]
     )
 
     state = _invoke(agent, {**_GO, "files": files()})
 
-    assert results(state) == ["undefined"]
+    assert results(state) == [["ENOSYS", "plain"]]
+    assert "/w.txt" not in state["files"]
+    assert "fs.writeFile" not in llm.prompts[0]
 
 
 def test_fs_throws_enosys_once_a_later_call_hides_read_file() -> None:
@@ -355,6 +408,18 @@ def test_fs_calls_count_toward_the_call_budget() -> None:
         '<error type="PTCCallBudgetExceeded">PTC call budget exceeded '
         "(limit=2, attempted=3, function=fs.readFile)</error>"
     )
+
+
+@pytest.mark.parametrize("function", ["access", "rm"])
+def test_a_budget_error_names_the_fs_function_the_code_called(function: str) -> None:
+    code = f'await fs.readFile("/docs/a.md"); await fs.{function}("/docs/b.txt")'
+    agent = create_deep_agent(
+        model=model(code), middleware=[CodeInterpreterMiddleware(max_ptc_calls=1)]
+    )
+
+    state = _invoke(agent, {**_GO, "files": files()})
+
+    assert f"attempted=2, function=fs.{function})" in _eval_message(state)
 
 
 def test_raw_read_results_stay_out_of_streams_and_checkpoints_of_a_turn_repl(

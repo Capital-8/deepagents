@@ -12,10 +12,11 @@ from langchain_core.messages import ToolCall, ToolMessage
 
 if TYPE_CHECKING:
     import contextvars
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import Awaitable, Callable, Collection, Mapping
 
     from deepagents.backends.protocol import (
         FileToolErrorArtifact,
+        LsArtifact,
         RawFileResultRequest,
         ReadFileArtifact,
     )
@@ -82,7 +83,9 @@ class FsError(Exception):
         return {"error": {"message": str(self), "code": self.code, **self.props}}
 
 
-def _strict_utf8(_path: str, artifact: ReadFileArtifact) -> str:
+def _strict_utf8(op: str, path: str, artifact: ReadFileArtifact) -> str:
+    if path.endswith("/"):
+        raise _system_error(op, path, "ENOTDIR")
     try:
         return artifact["content"].decode("utf-8")
     except UnicodeDecodeError:
@@ -91,21 +94,80 @@ def _strict_utf8(_path: str, artifact: ReadFileArtifact) -> str:
         raise FsError(msg, code=code, name="TypeError") from None
 
 
+def _names(_op: str, _path: str, artifact: LsArtifact) -> list[str]:
+    return [posixpath.basename(e["path"].rstrip("/")) for e in artifact["entries"]]
+
+
+def _is_directory(op: str, path: str, artifact: LsArtifact) -> bool:
+    target = path.rstrip("/")
+    if not target:
+        return True
+    entries = (e for e in artifact["entries"] if e["path"].rstrip("/") == target)
+    entry = next(entries, None)
+    if entry is None:
+        raise _system_error(op, path, "ENOENT")
+    if path != target and not entry["is_dir"]:
+        raise _system_error(op, path, "ENOTDIR")
+    return entry["is_dir"]
+
+
+def _parent(path: str, _args: dict[str, Any]) -> dict[str, Any]:
+    return {"path": posixpath.dirname(path)}
+
+
 @dataclass(frozen=True, slots=True)
 class _Operation:
+    fs_function: str
     tool: str
     syscall: str
     arguments: Callable[[str, dict[str, Any]], dict[str, Any]]
-    value: Callable[[str, Any], Any]
+    value: Callable[[str, str, Any], Any] | None
+    """`None` for a call that resolves to `undefined` and needs no raw result."""
 
 
 _OPERATIONS = {
     "readFile": _Operation(
-        "read_file", "open", lambda p, _: {"file_path": p}, _strict_utf8
+        "readFile", "read_file", "open", lambda p, _: {"file_path": p}, _strict_utf8
     ),
+    "writeFile": _Operation(
+        "writeFile",
+        "write_file",
+        "open",
+        lambda p, a: {"file_path": p, "content": a["data"]},
+        None,
+    ),
+    "readdir": _Operation("readdir", "ls", "scandir", lambda p, _: {"path": p}, _names),
+    "access": _Operation("access", "ls", "access", _parent, _is_directory),
+    # Node's `rm` names `lstat` when the path is missing.
+    "rmStat": _Operation("rm", "ls", "lstat", _parent, _is_directory),
+    "rm": _Operation("rm", "delete", "rm", lambda p, _: {"file_path": p}, None),
 }
 
 TOOLS = frozenset(op.tool for op in _OPERATIONS.values())
+
+_FUNCTIONS = (
+    (
+        {"read_file"},
+        "- `await fs.readFile(path)` returns the whole file as a string, without "
+        'line numbers or headers, as in `JSON.parse(await fs.readFile("/a.json"))`.',
+    ),
+    (
+        {"write_file"},
+        "- `await fs.writeFile(path, text)` creates or replaces a file, creating "
+        "parent directories.",
+    ),
+    (
+        {"ls"},
+        "- `await fs.readdir(dir)` lists entry names. `await fs.access(path)` "
+        "rejects with `ENOENT` if the path is missing; as a boolean, "
+        "`await fs.access(path).then(() => true, () => false)`.",
+    ),
+    (
+        {"delete", "ls"},
+        "- `await fs.rm(path, { recursive, force })` deletes as Node's does: a "
+        "directory needs `recursive: true`, and `force: true` ignores a missing path.",
+    ),
+)
 
 _NODE_CODES: dict[str | None, str] = {
     "file_not_found": "ENOENT",
@@ -126,16 +188,28 @@ _ERROR_TEXT = {
 }
 
 
+def docs(tool_names: Collection[str]) -> list[str]:
+    return [line for needs, line in _FUNCTIONS if needs <= set(tool_names)]
+
+
+def public_name(op: str) -> str:
+    return f"fs.{_OPERATIONS[op].fs_function}"
+
+
 def plan(
     op: str, args: dict[str, Any], tools: Mapping[str, BaseTool]
 ) -> tuple[str, BaseTool, dict[str, Any]]:
     operation = _OPERATIONS[op]
-    path = "/" + posixpath.normpath("/" + args["path"]).lstrip("/")
+    target = "/" + posixpath.normpath("/" + args["path"]).lstrip("/")
+    directory = args["path"].endswith("/") and target != "/"
+    path = target + "/" if directory else target
     tool = tools.get(operation.tool)
     if tool is None:
         reason = f"this agent has no `{operation.tool}` tool"
         raise _system_error(op, path, "ENOSYS", reason)
-    return path, tool, operation.arguments(path, args)
+    if directory and operation.tool == "write_file":
+        raise _system_error(op, path, "EISDIR")
+    return path, tool, operation.arguments(target, args)
 
 
 def refused(op: str, path: str, reason: str) -> FsError:
@@ -173,10 +247,12 @@ def result(op: str, path: str, outcome: Any) -> Any:
         raise _system_error(op, path, "EIO", reason)
     if outcome.status == "error":
         raise _failure(op, path, outcome)
+    if operation.value is None:
+        return None
     if outcome.artifact is None:
         reason = f"`{operation.tool}` returned no raw result"
         raise _system_error(op, path, "ENOSYS", reason)
-    return operation.value(path, outcome.artifact)
+    return operation.value(op, path, outcome.artifact)
 
 
 def _failure(op: str, path: str, message: ToolMessage) -> FsError:
