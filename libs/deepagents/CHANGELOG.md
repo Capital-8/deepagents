@@ -2,6 +2,13 @@
 
 # Deep Agents Changelog
 
+## [0.7.42](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.41...deepagents==0.7.42) (2026-11-25)
+
+
+### Bug Fixes
+
+* **sdk:** let `glob` pass interrupts and parent commands through ([#7820](https://github.com/langchain-ai/deepagents/issues/7820)) ([2cc7901](https://github.com/langchain-ai/deepagents/commit/2cc7901e46371840500d5e7ad4b6c45b96bd3de5))
+
 ## [0.7.41](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.40...deepagents==0.7.41) (2026-11-20)
 
 ### Bug Fixes
